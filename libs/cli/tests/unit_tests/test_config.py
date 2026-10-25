@@ -3578,6 +3578,81 @@ def test_config_to_compose_with_api_version():
     assert "FROM langchain/langgraphjs-api:0.2.74-node20" in actual_compose_str
 
 
+def test_generated_docker_content_uses_lf_line_endings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Dockerfile and compose text must not depend on `os.linesep`.
+
+    On Windows `os.linesep` is CRLF. `langgraph dockerfile` writes this text in
+    text mode, which turns every LF into CRLF again, so a CRLF produced here ends
+    up as CR CR LF in the Dockerfile. `langgraph build` and `up` pipe the text to
+    docker unchanged, so they would send CRLF instead of LF.
+    """
+
+    class _WindowsOs:
+        """Stand-in for `os` as seen by `langgraph_cli.config` on Windows."""
+
+        linesep = "\r\n"
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+    # Patch only the module under test: pytest and `Path.write_text` also read
+    # `os.linesep`.
+    monkeypatch.setattr("langgraph_cli.config.os", _WindowsOs())
+
+    (tmp_path / "reqs_pkg").mkdir()
+    (tmp_path / "reqs_pkg" / "requirements.txt").write_text("requests\n")
+    (tmp_path / "agent.py").touch()
+    config_path = tmp_path / "langgraph.json"
+    config_path.write_text("{}")
+
+    python_config = {
+        "dependencies": [".", "./reqs_pkg"],
+        "graphs": {"agent": "./agent.py:graph"},
+        "dockerfile_lines": ["ARG meow", "ARG foo"],
+        "env": {"FOO": "bar"},
+    }
+    node_config = {
+        "node_version": "20",
+        "graphs": {"agent": "./agent.js:graph"},
+        "dockerfile_lines": ["ARG meow", "ARG foo"],
+        "env": {"FOO": "bar"},
+    }
+
+    # `config_to_docker` rewrites the graph paths, so validate a fresh copy each time.
+    dockerfile, _ = config_to_docker(
+        config_path,
+        validate_config(copy.deepcopy(python_config)),
+        base_image="langchain/langgraph-api",
+    )
+    # Make sure the local requirements and non-package dependency paths ran.
+    assert "# -- Installing local requirements --" in dockerfile
+    assert "# -- Adding non-package dependency" in dockerfile
+    assert "ARG meow\nARG foo\n" in dockerfile
+
+    node_dockerfile, _ = config_to_docker(
+        PATH_TO_CONFIG,
+        validate_config(copy.deepcopy(node_config)),
+        base_image="langchain/langgraphjs-api",
+    )
+    assert "ARG meow\nARG foo\n" in node_dockerfile
+
+    compose = config_to_compose(
+        config_path,
+        validate_config(copy.deepcopy(python_config)),
+        "langchain/langgraph-api",
+    )
+    node_compose = config_to_compose(
+        PATH_TO_CONFIG,
+        validate_config(copy.deepcopy(node_config)),
+        "langchain/langgraphjs-api",
+    )
+
+    for text in (dockerfile, node_dockerfile, compose, node_compose):
+        assert "\r" not in text
+
+
 def test_default_base_image_combined_mode():
     """Test default_base_image returns langgraph-api for combined_queue_worker mode."""
     config = validate_config(
